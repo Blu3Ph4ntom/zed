@@ -1,7 +1,7 @@
 use super::*;
 use acp_thread::{
     AgentConnection, AgentModelGroupName, AgentModelList, PermissionOptions, ThreadStatus,
-    UserMessageId,
+    TokenUsageRatio, UserMessageId,
 };
 use agent_client_protocol::{self as acp};
 use agent_settings::AgentProfileId;
@@ -4449,6 +4449,89 @@ async fn test_tokens_before_message_after_truncate(cx: &mut TestAppContext) {
             thread.tokens_before_message(&message_1_id),
             None,
             "First message still has no tokens before it"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_auto_compact_on_token_warning(cx: &mut TestAppContext) {
+    init_test(cx);
+    let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;
+    let fake_model = model.as_fake();
+
+    let summary_model = Arc::new(FakeLanguageModel::default());
+    thread.update(cx, |thread, cx| {
+        thread.set_summarization_model(Some(summary_model.clone()), cx)
+    });
+
+    let long_content: String = "This is a test message. ".repeat(100_000);
+    let msg_1_id = UserMessageId::new();
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(msg_1_id.clone(), [long_content.as_str()], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_text_chunk("Response 1");
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        language_model::TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    ));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    let msg_2_id = UserMessageId::new();
+    thread
+        .update(cx, |thread, cx| {
+            thread.send(msg_2_id.clone(), ["Message 2"], cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    fake_model.send_last_completion_stream_text_chunk("Response 2");
+    fake_model.send_last_completion_stream_event(LanguageModelCompletionEvent::UsageUpdate(
+        language_model::TokenUsage {
+            input_tokens: 190_000,
+            output_tokens: 50_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        },
+    ));
+    fake_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    summary_model.send_next_completion_stream_text_chunk(
+        "<analysis>Test analysis</analysis>\n<summary>\nPrimary Request: Testing auto-compaction\nKey Technical Concepts: context window management\nFiles: none\nErrors: none\nProblem Solving: verified compaction works\nUser Messages: Message 1, Message 2\nPending Tasks: none\nCurrent Work: testing\nNext Step: continue\n</summary>",
+    );
+    summary_model.end_last_completion_stream();
+    cx.run_until_parked();
+
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            thread.compaction_count(),
+            1,
+            "compaction_count should be 1, got {}",
+            thread.compaction_count()
+        );
+        assert_eq!(
+            thread.consecutive_compaction_failures(),
+            0,
+            "consecutive_compaction_failures should be 0"
+        );
+        assert!(
+            thread
+                .messages()
+                .iter()
+                .any(|m| matches!(m, Message::System(s) if s.content.contains("compacted"))),
+            "messages should contain compact boundary system message"
+        );
+        assert!(
+            thread.messages().len() >= 3,
+            "messages should have boundary + summary + recent messages. Got {}",
+            thread.messages().len()
         );
     });
 }
