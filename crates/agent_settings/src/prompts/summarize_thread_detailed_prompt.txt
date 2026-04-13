@@ -1,6 +1,37 @@
-Generate a detailed summary of this conversation. Include:
-1. A brief overview of what was discussed
-2. Key facts or information discovered
-3. Outcomes or conclusions reached
-4. Any action items or next steps if any
-Format it in Markdown with headings and bullet points.
+CRITICAL: Respond with TEXT ONLY. Do not call any tools.
+
+- Do not use Read, Bash, Grep, Glob, Edit, Write, or any other tool.
+- You already have all the context you need in the conversation above.
+- Your entire response must be plain text: an analysis section followed by a summary section.
+
+<analysis>
+Draft your detailed analysis here. Include:
+- What the user was trying to accomplish
+- What approach was taken and why
+- Key technical decisions and their rationale
+- Files examined, modified, or created
+- Errors encountered and how they were resolved
+- Current state of the work
+</analysis>
+
+<summary>
+Generate a detailed summary of the conversation so far. Include ALL of the following sections:
+
+1. **Primary Request and Intent**: Capture all of the user's explicit requests and intents. What problem are they trying to solve?
+
+2. **Key Technical Concepts**: List all important technical concepts, technologies, frameworks, and patterns encountered or used.
+
+3. **Files and Code Sections**: Enumerate specific files and code sections examined, modified, or created. Include file paths and relevant code snippets.
+
+4. **Errors and Fixes**: List all errors that were encountered, and how they were fixed.
+
+5. **Problem Solving**: Document problems solved and any ongoing troubleshooting efforts. What approaches were tried?
+
+6. **All User Messages**: List ALL user messages that were not tool results. These are the actual requests from the user.
+
+7. **Pending Tasks**: Outline any remaining or pending tasks. What still needs to be done?
+
+8. **Current Work**: Describe precisely what was being worked on when the context limit was reached.
+
+9. **Next Step**: List the immediate next step that should be taken to continue the work.
+</summary>
