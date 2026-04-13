@@ -38,8 +38,8 @@ use language_model::{
     LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
     LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
     LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, Role, SelectedModel, Speed, StopReason,
-    TokenUsage, ZED_CLOUD_PROVIDER_ID,
+    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, Role, SelectedModel, Speed,
+    StopReason, TokenUsage, ZED_CLOUD_PROVIDER_ID,
 };
 use project::Project;
 use prompt_store::ProjectContext;
@@ -63,6 +63,11 @@ use uuid::Uuid;
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+
+const COMPACTION_AUTOCOMPACT_BUFFER_TOKENS: u64 = 13_000;
+const COMPACTION_MAX_OUTPUT_TOKENS_FOR_SUMMARY: u64 = 20_000;
+const COMPACTION_MAX_CONSECUTIVE_FAILURES: u32 = 3;
+const COMPACTION_KEEP_RECENT_TOKENS: u64 = 20_000;
 
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
@@ -124,6 +129,19 @@ pub enum Message {
     User(UserMessage),
     Agent(AgentMessage),
     Resume,
+    System(SystemMessage),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemMessage {
+    pub content: SharedString,
+    pub compact_metadata: Option<CompactMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactMetadata {
+    pub trigger: CompactTrigger,
+    pub pre_tokens: u64,
 }
 
 impl Message {
@@ -150,6 +168,12 @@ impl Message {
                 cache: false,
                 reasoning_details: None,
             }],
+            Message::System(message) => vec![LanguageModelRequestMessage {
+                role: Role::System,
+                content: vec![MessageContent::Text(message.content.to_string())],
+                cache: false,
+                reasoning_details: None,
+            }],
         }
     }
 
@@ -158,6 +182,9 @@ impl Message {
             Message::User(message) => message.to_markdown(),
             Message::Agent(message) => message.to_markdown(),
             Message::Resume => "[resume]\n".into(),
+            Message::System(message) => {
+                format!("[system: {}]\n", message.content)
+            }
         }
     }
 
@@ -165,6 +192,7 @@ impl Message {
         match self {
             Message::User(_) | Message::Resume => Role::User,
             Message::Agent(_) => Role::Assistant,
+            Message::System(_) => Role::System,
         }
     }
 }
@@ -933,6 +961,12 @@ enum CompletionError {
     Other(#[from] anyhow::Error),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactTrigger {
+    Manual,
+    Auto,
+}
+
 pub struct Thread {
     id: acp::SessionId,
     prompt_id: PromptId,
@@ -979,6 +1013,33 @@ pub struct Thread {
     ui_scroll_position: Option<gpui::ListOffset>,
     /// Weak references to running subagent threads for cancellation propagation
     running_subagents: Vec<WeakEntity<Thread>>,
+    /// LLM-generated summary of the conversation context, used to replace old messages
+    /// when the context window nears capacity. Prepended to each completion request.
+    context_summary: Option<SharedString>,
+    /// Number of times this thread has been auto-compacted.
+    compaction_count: u32,
+    /// Consecutive auto-compaction failures (circuit breaker).
+    consecutive_compaction_failures: u32,
+    /// Cumulative input tokens across all requests in this thread.
+    #[allow(unused)]
+    cumulative_input_tokens: u64,
+    /// Pending compaction task (prevents concurrent compactions).
+    pending_compaction: Option<Task<()>>,
+    /// Messages kept during compaction (applied atomically on success).
+    compaction_kept_messages: Vec<Message>,
+}
+
+#[cfg(test)]
+impl Thread {
+    pub(crate) fn compaction_count(&self) -> u32 {
+        self.compaction_count
+    }
+    pub(crate) fn consecutive_compaction_failures(&self) -> u32 {
+        self.consecutive_compaction_failures
+    }
+    pub(crate) fn messages(&self) -> &[Message] {
+        &self.messages
+    }
 }
 
 impl Thread {
@@ -1072,6 +1133,12 @@ impl Thread {
             running_turn: None,
             has_queued_message: false,
             pending_message: None,
+            context_summary: None,
+            compaction_count: 0,
+            consecutive_compaction_failures: 0,
+            cumulative_input_tokens: 0,
+            pending_compaction: None,
+            compaction_kept_messages: Vec::new(),
             tools: BTreeMap::default(),
             request_token_usage: HashMap::default(),
             cumulative_token_usage: TokenUsage::default(),
@@ -1153,6 +1220,7 @@ impl Thread {
                     }
                 }
                 Message::Resume => {}
+                Message::System(_) => {}
             }
         }
         rx
@@ -1305,6 +1373,12 @@ impl Thread {
             running_turn: None,
             has_queued_message: false,
             pending_message: None,
+            context_summary: None,
+            compaction_count: 0,
+            consecutive_compaction_failures: 0,
+            cumulative_input_tokens: 0,
+            pending_compaction: None,
+            compaction_kept_messages: Vec::new(),
             tools: BTreeMap::default(),
             request_token_usage: db_thread.request_token_usage.clone(),
             cumulative_token_usage: db_thread.cumulative_token_usage,
@@ -1650,8 +1724,248 @@ impl Thread {
 
         self.request_token_usage
             .insert(last_user_message.id.clone(), update);
-        cx.emit(TokenUsageUpdated(self.latest_token_usage()));
+        self.cumulative_input_tokens = self
+            .cumulative_input_tokens
+            .saturating_add(update.input_tokens);
+
+        let token_usage = self.latest_token_usage();
+        cx.emit(TokenUsageUpdated(token_usage));
         cx.notify();
+    }
+
+    fn effective_context_window(&self) -> Option<u64> {
+        let model = self.model.as_ref()?;
+        let max_tokens = model.max_token_count();
+        let max_output = model.max_output_tokens().unwrap_or(0);
+        let reserved = max_output.min(COMPACTION_MAX_OUTPUT_TOKENS_FOR_SUMMARY);
+        max_tokens.checked_sub(reserved)
+    }
+
+    fn auto_compact_threshold(&self) -> Option<u64> {
+        let effective_window = self.effective_context_window()?;
+        effective_window.checked_sub(COMPACTION_AUTOCOMPACT_BUFFER_TOKENS)
+    }
+
+    fn should_auto_compact(&self) -> bool {
+        if self.consecutive_compaction_failures >= COMPACTION_MAX_CONSECUTIVE_FAILURES {
+            return false;
+        }
+        let threshold = match self.auto_compact_threshold() {
+            Some(t) => t,
+            None => return false,
+        };
+        self.estimate_total_message_tokens() >= threshold
+    }
+
+    fn estimate_total_message_tokens(&self) -> u64 {
+        self.messages
+            .iter()
+            .map(Self::estimate_message_tokens)
+            .sum()
+    }
+
+    fn find_compact_boundary_index(&self) -> Option<usize> {
+        self.messages.iter().position(|msg| {
+            if let Message::System(sys_msg) = msg {
+                if let Some(metadata) = &sys_msg.compact_metadata {
+                    return metadata.trigger == CompactTrigger::Auto
+                        || metadata.trigger == CompactTrigger::Manual;
+                }
+            }
+            false
+        })
+    }
+
+    fn auto_compact(&mut self, cx: &mut Context<Self>) {
+        if self.pending_compaction.is_some() {
+            return;
+        }
+        if !self.should_auto_compact() {
+            return;
+        }
+
+        let model = self.summarization_model.clone();
+        let Some(model) = model else {
+            log::warn!("Auto-compaction: no summarization model available");
+            self.consecutive_compaction_failures += 1;
+            return;
+        };
+
+        let temperature = AgentSettings::temperature_for_model(&model, cx);
+
+        let pre_tokens = self.estimate_total_message_tokens();
+        self.compaction_count += 1;
+        let compaction_count = self.compaction_count;
+
+        let (kept_messages, old_messages): (Vec<Message>, Vec<Message>) = {
+            let boundary_idx = self.find_compact_boundary_index();
+            let messages_to_compact = if let Some(idx) = boundary_idx {
+                &self.messages[idx..]
+            } else {
+                &self.messages[..]
+            };
+
+            let mut total_tokens: u64 = 0;
+            let mut recent_indices: Vec<usize> = Vec::new();
+
+            for (i, msg) in messages_to_compact.iter().enumerate() {
+                let msg_tokens = Self::estimate_message_tokens(msg);
+                if total_tokens + msg_tokens > COMPACTION_KEEP_RECENT_TOKENS {
+                    break;
+                }
+                recent_indices.push(i);
+                total_tokens += msg_tokens;
+            }
+
+            let old_indices: Vec<usize> = (0..messages_to_compact.len())
+                .filter(|i| !recent_indices.contains(i))
+                .collect();
+
+            if old_indices.is_empty() {
+                self.consecutive_compaction_failures += 1;
+                return;
+            }
+
+            let old: Vec<Message> = old_indices
+                .iter()
+                .map(|&i| messages_to_compact[i].clone())
+                .collect();
+
+            let kept: Vec<Message> = recent_indices
+                .iter()
+                .map(|&i| messages_to_compact[i].clone())
+                .collect();
+
+            (kept, old)
+        };
+
+        let task = cx.spawn({
+            let model = model.clone();
+            let old_messages = old_messages;
+            let temperature = temperature.clone();
+            async move |this, cx| {
+                let mut summary_text = String::new();
+
+                let mut request = LanguageModelRequest {
+                    intent: Some(CompletionIntent::ThreadContextSummarization),
+                    temperature,
+                    ..Default::default()
+                };
+
+                for msg in &old_messages {
+                    request.messages.extend(msg.to_request());
+                }
+                request.messages.push(LanguageModelRequestMessage {
+                    role: Role::User,
+                    content: vec![SUMMARIZE_THREAD_DETAILED_PROMPT.into()],
+                    cache: false,
+                    reasoning_details: None,
+                });
+
+                let mut stream = match model.stream_completion(request, cx).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Auto-compaction: failed to start stream: {}", e);
+                        this.update(cx, |this, _| {
+                            this.pending_compaction = None;
+                            this.consecutive_compaction_failures += 1;
+                        })
+                        .ok();
+                        return;
+                    }
+                };
+                while let Some(event) = stream.next().await {
+                    if let Ok(LanguageModelCompletionEvent::Text(text)) = event {
+                        summary_text.push_str(&text);
+                    }
+                }
+
+                if summary_text.is_empty() {
+                    log::warn!("Auto-compaction: empty summary generated");
+                    this.update(cx, |this, _| {
+                        this.pending_compaction = None;
+                        this.consecutive_compaction_failures += 1;
+                    })
+                    .ok();
+                    return;
+                }
+
+                summary_text = Self::format_compact_summary(&summary_text);
+
+                log::info!(
+                    "Auto-compacted {} messages into summary ({} chars), compaction #{}",
+                    old_messages.len(),
+                    summary_text.len(),
+                    compaction_count
+                );
+
+                this.update(cx, |this, _| {
+                    let boundary = Message::System(SystemMessage {
+                        content: "Conversation compacted".into(),
+                        compact_metadata: Some(CompactMetadata {
+                            trigger: CompactTrigger::Auto,
+                            pre_tokens,
+                        }),
+                    });
+                    let summary_msg = Message::User(UserMessage {
+                        id: UserMessageId::new(),
+                        content: vec![UserMessageContent::Text(summary_text)],
+                    });
+                    let kept = std::mem::take(&mut this.compaction_kept_messages);
+                    if let Some(old_boundary_idx) = this.find_compact_boundary_index() {
+                        this.messages.drain(old_boundary_idx..old_boundary_idx + 2);
+                    }
+                    this.messages.insert(0, boundary);
+                    this.messages.insert(1, summary_msg);
+                    this.messages.extend(kept);
+                    this.consecutive_compaction_failures = 0;
+                    this.pending_compaction = None;
+                })
+                .ok();
+            }
+        });
+        self.pending_compaction = Some(task);
+        self.compaction_kept_messages = kept_messages;
+        for msg in &self.compaction_kept_messages {
+            if let Message::User(user_msg) = msg {
+                self.request_token_usage.remove(&user_msg.id);
+            }
+        }
+    }
+
+    fn estimate_message_tokens(msg: &Message) -> u64 {
+        let text = match msg {
+            Message::User(m) => m.to_markdown(),
+            Message::Agent(m) => m.to_markdown(),
+            Message::Resume => "Continue where you left off".to_string(),
+            Message::System(m) => m.content.to_string(),
+        };
+        (text.len() as u64 / 4).max(1)
+    }
+
+    fn format_compact_summary(summary: &str) -> String {
+        let mut result = summary.to_string();
+
+        result = result.trim().lines().collect::<Vec<_>>().join("\n");
+
+        if result.contains("<analysis>") || result.contains("<summary>") {
+            let analysis_re = regex::Regex::new(r"(?s)<analysis>.*?</analysis>").ok();
+            if let Some(re) = analysis_re {
+                result = re.replace_all(&result, "").to_string();
+            }
+            let summary_re = regex::Regex::new(r"(?s)<summary>\s*(.*?)\s*</summary>").ok();
+            if let Some(re) = summary_re {
+                if let Some(caps) = re.captures(&result) {
+                    let content = caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+                    result = format!(
+                        "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n{}\n\nContinue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary.",
+                        content.trim()
+                    );
+                }
+            }
+        }
+
+        result
     }
 
     pub fn truncate(&mut self, message_id: UserMessageId, cx: &mut Context<Self>) -> Result<()> {
@@ -1670,7 +1984,7 @@ impl Thread {
                 Message::User(message) => {
                     self.request_token_usage.remove(&message.id);
                 }
-                Message::Agent(_) | Message::Resume => {}
+                Message::Agent(_) | Message::Resume | Message::System(_) => {}
             }
         }
         self.clear_summary();
@@ -2058,6 +2372,7 @@ impl Thread {
 
             this.update(cx, |this, cx| {
                 this.flush_pending_message(cx);
+                this.auto_compact(cx);
                 if this.title.is_none() && this.pending_title_generation.is_none() {
                     this.generate_title(cx);
                 }
@@ -2696,6 +3011,7 @@ impl Thread {
     fn clear_summary(&mut self) {
         self.summary = None;
         self.pending_summary_generation = None;
+        self.context_summary = None;
     }
 
     fn last_user_message(&self) -> Option<&UserMessage> {
@@ -2706,6 +3022,7 @@ impl Thread {
                 Message::User(user_message) => Some(user_message),
                 Message::Agent(_) => None,
                 Message::Resume => None,
+                Message::System(_) => None,
             })
     }
 
@@ -2993,6 +3310,7 @@ impl Thread {
             cache: false,
             reasoning_details: None,
         }];
+
         for message in &self.messages {
             messages.extend(message.to_request());
         }
@@ -3018,6 +3336,7 @@ impl Thread {
                 Message::User(_) => markdown.push_str("## User\n\n"),
                 Message::Agent(_) => markdown.push_str("## Assistant\n\n"),
                 Message::Resume => {}
+                Message::System(_) => markdown.push_str("## System\n\n"),
             }
             markdown.push_str(&message.to_markdown());
         }
